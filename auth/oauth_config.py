@@ -112,6 +112,8 @@ class OAuthConfig:
         explicit_uri = os.getenv("GOOGLE_OAUTH_REDIRECT_URI")
         if explicit_uri:
             return explicit_uri
+        if self.external_url:
+            return f"{self.external_url.rstrip('/')}/oauth2callback"
         return f"{self.base_url}/oauth2callback"
 
     @staticmethod

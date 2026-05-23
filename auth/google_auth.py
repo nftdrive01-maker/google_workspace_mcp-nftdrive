@@ -213,7 +213,7 @@ def load_client_secrets_from_env() -> Optional[Dict[str, Any]]:
         # Create config structure that matches Google client secrets format.
         client_config = {
             "client_id": client_id,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
             "token_uri": "https://oauth2.googleapis.com/token",
             "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
         }
@@ -501,6 +501,15 @@ async def start_auth_flow(
         f"[start_auth_flow] Initiating auth for {user_display_name} with scopes for enabled tools."
     )
 
+    def normalize_google_auth_url(url: str) -> str:
+        """Normalize legacy Google OAuth auth endpoints to the current path."""
+        if not isinstance(url, str):
+            return url
+        return (
+            url.replace("https://accounts.google.com/oauth2/auth", "https://accounts.google.com/o/oauth2/v2/auth")
+            .replace("https://accounts.google.com/o/oauth2/auth", "https://accounts.google.com/o/oauth2/v2/auth")
+        )
+
     # Note: Caller should ensure OAuth callback is available before calling this function
 
     try:
@@ -534,11 +543,12 @@ async def start_auth_flow(
             required_scopes=current_scopes,
             session_id=session_id,
         )
-        # Add login_hint if email provided so Google pre-selects the right account
+        # Add login_hint if email provided so Google pre-selects the right account.
         auth_kwargs = {"access_type": "offline", "prompt": prompt_type}
         if initial_email_provided:
             auth_kwargs["login_hint"] = user_google_email
         auth_url, _ = flow.authorization_url(**auth_kwargs)
+        auth_url = normalize_google_auth_url(auth_url)
 
         browser_opened = False
         should_open_browser = (
@@ -560,9 +570,13 @@ async def start_auth_flow(
                 logger.warning(f"Could not open browser automatically: {e}")
 
         store = get_oauth21_session_store()
+        # Users may need several minutes to complete Google consent and account selection.
+        # Keep state valid a bit longer to avoid false "expired state" errors.
+        oauth_state_ttl = int(os.getenv("GOOGLE_OAUTH_STATE_TTL_SECONDS", "1800"))
         store.store_oauth_state(
             oauth_state,
             session_id=session_id,
+            expires_in_seconds=max(300, oauth_state_ttl),
             code_verifier=flow.code_verifier,
         )
 
@@ -590,13 +604,12 @@ async def start_auth_flow(
             message_lines.extend(
                 [
                     f"2. After successful authorization{session_info_for_llm}, the browser page will display the authenticated email address.",
-                    "   **LLM: Instruct the user to provide you with this email address.**",
-                    "3. Once you have the email, **retry their original command, ensuring you include this `user_google_email`.**",
+                    "3. Provide that email address in your next command as user_google_email.",
                 ]
             )
         else:
             message_lines.append(
-                f"2. After successful authorization{session_info_for_llm}, **retry their original command**."
+                f"2. After successful authorization{session_info_for_llm}, retry the original command."
             )
 
         message_lines.append(
@@ -677,16 +690,56 @@ async def handle_auth_callback(
         parsed_response = urlparse(authorization_response)
         state_values = parse_qs(parsed_response.query).get("state")
         state = state_values[0] if state_values else None
+        is_local_callback = (parsed_response.hostname or "") in {
+            "localhost",
+            "127.0.0.1",
+        }
+        can_use_local_state_fallback = is_local_callback and session_id is None
+
+        state_for_flow = state
 
         if state:
-            state_info = store.validate_and_consume_oauth_state(
-                state, session_id=session_id
-            )
+            try:
+                state_info = store.validate_and_consume_oauth_state(
+                    state, session_id=session_id
+                )
+            except ValueError as state_error:
+                can_fallback_invalid_state = (
+                    (
+                        allow_missing_state_fallback
+                        and os.getenv("MCP_SINGLE_USER_MODE") == "1"
+                        and session_id is None
+                    )
+                    or can_use_local_state_fallback
+                )
+                if can_fallback_invalid_state:
+                    can_fallback_invalid_state = (
+                        "Invalid or expired OAuth state parameter"
+                        in str(state_error)
+                    )
+                if not can_fallback_invalid_state:
+                    raise
+
+                logger.warning(
+                    "OAuth callback state was invalid/expired; using most recent stored state (single-user fallback)"
+                )
+                state_info = store.consume_latest_oauth_state(
+                    initiating_session_id=session_id,
+                    allow_any_session=True,
+                )
+                if not state_info:
+                    raise ValueError(
+                        "Invalid or expired OAuth state parameter and no stored fallback state available"
+                    )
+
+                # For fallback recovery, do not pin oauthlib state validation to
+                # the callback's stale state value.
+                state_for_flow = None
         elif (
             allow_missing_state_fallback
             and os.getenv("MCP_SINGLE_USER_MODE") == "1"
             and session_id is None
-        ):
+        ) or can_use_local_state_fallback:
             # stdio mode fallback: state may be absent from Google's redirect
             # (e.g. when prompt=select_account is used with revoked credentials).
             # Use the most recently stored state to recover the PKCE code_verifier.
@@ -722,7 +775,7 @@ async def handle_auth_callback(
         flow = create_oauth_flow(
             scopes=scopes,
             redirect_uri=redirect_uri,
-            state=state,
+            state=state_for_flow,
             code_verifier=state_info.get("code_verifier"),
             autogenerate_code_verifier=False,
         )
@@ -1224,7 +1277,7 @@ async def get_authenticated_google_service(
     service_name: str,  # "gmail", "calendar", "drive", "docs"
     version: str,  # "v1", "v3"
     tool_name: str,  # For logging/debugging
-    user_google_email: str,  # Required - no more Optional
+    user_google_email: Optional[str],
     required_scopes: List[str],
     session_id: Optional[str] = None,  # Session context for logging
 ) -> tuple[Any, str]:
@@ -1236,7 +1289,7 @@ async def get_authenticated_google_service(
         service_name: The Google service name ("gmail", "calendar", "drive", "docs")
         version: The API version ("v1", "v3", etc.)
         tool_name: The name of the calling tool (for logging/debugging)
-        user_google_email: The user's Google email address (required)
+        user_google_email: Optional user's Google email address
         required_scopes: List of required OAuth scopes
 
     Returns:
@@ -1288,19 +1341,35 @@ async def get_authenticated_google_service(
                 f"[{tool_name}] Unable to obtain FastMCP session ID from any source"
             )
 
-    logger.info(
-        f"[{tool_name}] Attempting to get authenticated {service_name} service. Email: '{user_google_email}', Session: '{session_id}'"
+    resolved_email = (
+        user_google_email.strip()
+        if isinstance(user_google_email, str)
+        and user_google_email.strip()
+        and "@" in user_google_email
+        else None
     )
 
-    # Validate email format
-    if not user_google_email or "@" not in user_google_email:
+    if not resolved_email and session_id:
+        try:
+            resolved_email = get_oauth21_session_store().get_user_by_mcp_session(
+                session_id
+            )
+        except Exception as e:
+            logger.debug(f"[{tool_name}] Could not resolve user from session: {e}")
+
+    logger.info(
+        f"[{tool_name}] Attempting to get authenticated {service_name} service. Email: '{resolved_email}', Session: '{session_id}'"
+    )
+
+    # In multi-user mode, explicit email (or session-resolved email) is required.
+    if not resolved_email and os.getenv("MCP_SINGLE_USER_MODE") != "1":
         error_msg = f"Authentication required for {tool_name}. No valid 'user_google_email' provided. Please provide a valid Google email address."
         logger.info(f"[{tool_name}] {error_msg}")
         raise GoogleAuthenticationError(error_msg)
 
     credentials = await asyncio.to_thread(
         get_credentials,
-        user_google_email=user_google_email,
+        user_google_email=resolved_email,
         required_scopes=required_scopes,
         client_secrets_path=CONFIG_CLIENT_SECRETS_PATH,
         session_id=session_id,  # Pass through session context
@@ -1308,11 +1377,16 @@ async def get_authenticated_google_service(
 
     if not credentials or not credentials.valid:
         logger.warning(
-            f"[{tool_name}] No valid credentials. Email: '{user_google_email}'."
+            f"[{tool_name}] No valid credentials. Email: '{resolved_email}'."
         )
-        logger.info(
-            f"[{tool_name}] Valid email '{user_google_email}' provided, initiating auth flow."
-        )
+        if resolved_email:
+            logger.info(
+                f"[{tool_name}] Valid email '{resolved_email}' provided, initiating auth flow."
+            )
+        else:
+            logger.info(
+                f"[{tool_name}] No explicit email provided; initiating auth flow for session/user discovery."
+            )
 
         redirect_uri = get_oauth_redirect_uri()
         transport_mode = get_transport_mode()
@@ -1335,7 +1409,7 @@ async def get_authenticated_google_service(
 
         # Generate auth URL and raise exception with it
         auth_response = await start_auth_flow(
-            user_google_email=user_google_email,
+            user_google_email=resolved_email,
             service_name=f"Google {service_name.title()}",
             redirect_uri=redirect_uri,
         )
@@ -1345,7 +1419,7 @@ async def get_authenticated_google_service(
 
     try:
         service = build(service_name, version, credentials=credentials)
-        log_user_email = user_google_email
+        log_user_email = resolved_email or "unknown"
 
         # Try to get email from credentials if needed for validation
         if credentials and credentials.id_token:

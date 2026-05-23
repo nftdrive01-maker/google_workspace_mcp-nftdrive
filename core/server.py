@@ -193,7 +193,7 @@ class SecureFastMCP(FastMCP):
         runtime still resolves the email correctly via the service decorator.
         """
         tools = list(await super().list_tools(run_middleware=run_middleware))
-        if not USER_GOOGLE_EMAIL or is_oauth21_enabled():
+        if (not USER_GOOGLE_EMAIL and os.getenv("MCP_SINGLE_USER_MODE") != "1") or is_oauth21_enabled():
             return tools
         patched = []
         for tool in tools:
@@ -235,6 +235,11 @@ if USER_GOOGLE_EMAIL:
 
 When using Google Workspace tools, always use `{USER_GOOGLE_EMAIL}` as the `user_google_email` parameter. Do not ask the user for their email address."""
     logger.info(f"Server instructions configured for user: {USER_GOOGLE_EMAIL}")
+elif os.getenv("MCP_SINGLE_USER_MODE") == "1":
+    _server_instructions = """Single-user mode is enabled.
+
+When using Google Workspace tools, do not ask the user for their email address. Use the authenticated session's Google account automatically."""
+    logger.info("Server instructions configured for single-user mode")
 
 server = SecureFastMCP(
     name="google_workspace",
@@ -720,6 +725,7 @@ async def legacy_oauth2_callback(request: Request) -> HTMLResponse:
             authorization_response=str(request.url),
             redirect_uri=get_oauth_redirect_uri_for_current_mode(),
             session_id=mcp_session_id,
+            allow_missing_state_fallback=os.getenv("MCP_SINGLE_USER_MODE") == "1",
         )
 
         logger.info(
